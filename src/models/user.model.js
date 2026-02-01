@@ -1,4 +1,6 @@
 import mongoose from "mongoose";
+import speakeasy from "speakeasy";
+import crypto from "crypto";
 
 const userSchema = new mongoose.Schema(
   {
@@ -9,6 +11,7 @@ const userSchema = new mongoose.Schema(
       trim: true,
       index: true,
     },
+
     name: {
       type: String,
       required: true,
@@ -22,12 +25,14 @@ const userSchema = new mongoose.Schema(
       required: true,
       unique: true,
       lowercase: true,
+      trim: true,
       index: true,
     },
 
     emailVerifiedAt: {
       type: Date,
       default: null,
+      index: true,
     },
 
     role: {
@@ -35,6 +40,17 @@ const userSchema = new mongoose.Schema(
       enum: ["student", "instructor", "admin"],
       default: "student",
       index: true,
+    },
+
+    isBlocked: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+
+    lastLoginAt: {
+      type: Date,
+      default: null,
     },
 
     avatar: {
@@ -46,63 +62,122 @@ const userSchema = new mongoose.Schema(
       },
     },
 
-    isBlocked: {
+    twoFactorEnabled: {
       type: Boolean,
       default: false,
     },
 
-    lastLoginAt: {
+    twoFactorSecret: {
+      type: String,
+      select: false,
+    },
+
+    twoFactorTempSecret: {
+      type: String,
+      select: false,
+    },
+
+    twoFactorRecoveryCodes: {
+      type: [String],
+      select: false,
+    },
+
+    twoFactorEnabledAt: {
       type: Date,
-      default: null,
+    },
+
+    twoFactorFailedAttempts: {
+      type: Number,
+      default: 0,
+    },
+
+    twoFactorLockedUntil: {
+      type: Date,
     },
   },
   { timestamps: true },
 );
 
+
 userSchema.pre("save", function () {
   if (!this.avatar?.url) {
     this.avatar = {
       url: `https://ui-avatars.com/api/?name=${encodeURIComponent(
-        this.name,
+        this.name
       )}&background=random&color=random`,
       localPath: "",
       isCustom: false,
     };
   }
-  // next();
 });
+
 
 userSchema.pre("validate", async function () {
   if (this.username) return;
 
-  const baseUsername = this.name
+  const base = this.name
     .toLowerCase()
     .replace(/[^a-z0-9]/g, "")
     .slice(0, 20);
 
-  let username = baseUsername;
-
+  let username = base;
   const User = mongoose.models.User;
 
-  const exists = await User.findOne({ username });
-  if (!exists) {
+  if (!(await User.exists({ username }))) {
     this.username = username;
     return;
   }
 
   while (true) {
-    const suffix = Math.floor(Math.random() * 10000);
-    username = `${baseUsername}_${suffix}`;
+    const suffix = Math.floor(1000 + Math.random() * 9000);
+    username = `${base}_${suffix}`;
 
-    const taken = await User.findOne({ username });
-    if (!taken) {
+    if (!(await User.exists({ username }))) {
       this.username = username;
       return;
     }
   }
 });
 
-userSchema.index({ emailVerifiedAt: 1 });
-userSchema.index({ isBlocked: 1 });
 
-export const User = mongoose.models.User || mongoose.model("User", userSchema);
+userSchema.index({ email: 1, emailVerifiedAt: 1 });
+userSchema.index({ role: 1, isBlocked: 1 });
+
+userSchema.methods.verifyTwoFactorCode = function (token) {
+  if (this.twoFactorLockedUntil && this.twoFactorLockedUntil > new Date()) {
+    throw new Error("2FA account is temporarily locked due to too many failed attempts");
+  }
+
+  const valid = speakeasy.totp.verify({
+    secret: this.twoFactorSecret,
+    encoding: "base32",
+    token: token,
+    window: 1,
+  });
+
+  if (valid) {
+    this.twoFactorFailedAttempts = 0;
+    this.twoFactorLockedUntil = null;
+    return true;
+  }
+
+  this.twoFactorFailedAttempts += 1;
+  if (this.twoFactorFailedAttempts >= 5) {
+    this.twoFactorLockedUntil = new Date(Date.now() + 10 * 60 * 1000); // 10 min lock
+  }
+  return false;
+};
+
+userSchema.methods.verifyRecoveryCode = function (code) {
+  const hash = crypto.createHash("sha256").update(code).digest("hex");
+  const index = this.twoFactorRecoveryCodes.indexOf(hash);
+
+  if (index !== -1) {
+    this.twoFactorRecoveryCodes.splice(index, 1);
+    return true;
+  }
+  return false;
+};
+
+export const User =
+  mongoose.models.User || mongoose.model("User", userSchema);

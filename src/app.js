@@ -4,9 +4,9 @@ import healthRoute from './routes/healthcheck.routes.js';
 import authRoutes from './routes/auth.routes.js';
 import errorHandler from './middlewares/error.middleware.js';
 // import userRoutes from './routes/user.routes.js';
-// import accountRoutes from './routes/account.routes.js';
-// import sessionRoutes from './routes/session.routes.js';
-// import verificationRoutes from './routes/verification.routes.js';
+import accountRoutes from './routes/account.routes.js';
+import sessionRoutes from './routes/session.routes.js';
+import passport from './config/passport.js'
 
 const app = express();
 app.use(express.json({limit:'16kb'}))
@@ -20,12 +20,14 @@ app.use(cors({
     allowedHeaders: ["Authorization","Content-Type"]
 }))
 
+app.use(passport.initialize());
+
+
 app.use("/api/v1/healthcheck",healthRoute)
 app.use('/api/v1/auth', authRoutes);
 // app.use('/api/users', userRoutes);
-// app.use('/api/accounts', accountRoutes);
-// app.use('/api/sessions', sessionRoutes);
-// app.use('/api/verifications', verificationRoutes);
+app.use('/api/v1/accounts', accountRoutes);
+app.use('/api/v1/sessions', sessionRoutes);
 
 
 app.use(errorHandler)

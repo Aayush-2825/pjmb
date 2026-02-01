@@ -1,4 +1,3 @@
-import mongoose from "mongoose";
 import { Account } from "../models/account.model.js";
 import { Session } from "../models/session.model.js";
 import { User } from "../models/user.model.js";
@@ -27,13 +26,11 @@ import {
 // ==========================================
 const registerUser = asyncHandler(async (req, res) => {
   const { name, password } = req.body;
-  // Sanitize email: trim whitespace and lowercase
   const email = req.body.email?.toLowerCase().trim();
 
   if (!name || !email || !password)
     throw new ApiError(400, "All fields are required");
 
-  // Check duplicate outside transaction for speed
   const existingUser = await User.findOne({ email });
   if (existingUser) throw new ApiError(409, "User already exists");
 
@@ -41,87 +38,117 @@ const registerUser = asyncHandler(async (req, res) => {
   const rawVerificationToken = generateVerificationToken();
   const hashVerificationToken = hashedVerificationToken(rawVerificationToken);
 
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
   try {
-    const [user] = await User.create([{ name, email }], { session });
+    const user = await User.create({ name, email });
+
 
     await Account.create(
-      [
-        {
-          userId: user._id,
-          provider: "credentials",
-          providerAccountId: email,
-          passwordHash: hashedPassword,
-        },
-      ],
-      { session },
+      {
+        userId: user._id,
+        provider: "credentials",
+        providerAccountId: email,
+        passwordHash: hashedPassword,
+      },
     );
-
     await Verification.create(
-      [
-        {
-          identifier: email,
-          type: "email-verification",
-          token: hashVerificationToken,
-          expiresAt: calculateExpirationDate("15m"),
-        },
-      ],
-      { session },
+
+      {
+        identifier: email,
+        type: "email-verification",
+        token: hashVerificationToken,
+        expiresAt: calculateExpirationDate("15m"),
+      }
     );
 
-    await session.commitTransaction();
-    session.endSession();
-
-    // Send Email (Non-blocking)
     const verificationUrl = `${process.env.APP_ORIGIN}/confirm-account?code=${rawVerificationToken}`;
+
     setImmediate(() => {
       sendEmail({
         to: email,
         subject: "Verify your email",
-        html: `<p>Hi ${user.name}, verify here: <a href="${verificationUrl}">Link</a></p>`,
+        html: `<p>Hi ${name}, verify here: <a href="${verificationUrl}">Link</a></p>`,
       }).catch((err) => console.error("Email failed:", err));
     });
 
-    return res
-      .status(201)
-      .json(
-        new ApiResponse(
-          201,
-          { user: { id: user._id, email } },
-          "Verify your email.",
-        ),
-      );
+    return res.status(201).json(
+      new ApiResponse(
+        201,
+        { user: { id: user._id, email } },
+        "Verify your email.",
+      ),
+    );
   } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
-    throw new ApiError(500, "Registration failed.");
+    throw new ApiError(500, "Registration failed.", err);
   }
 });
 
 // ==========================================
-// 2. LOGIN (Session & Token Issue)
+// LOGIN (Password + Optional 2FA)
 // ==========================================
 const loginUser = asyncHandler(async (req, res) => {
-  const { password } = req.body;
-  const email = req.body.email?.toLowerCase().trim();
+  const { email, password, loginCode, recoveryCode } = req.body;
+  const normalizedEmail = email?.toLowerCase().trim();
 
-  if (!email || !password) throw new ApiError(400, "Required fields missing");
+  if (!normalizedEmail || !password)
+    throw new ApiError(400, "Email and password required");
 
-  const user = await User.findOne({ email });
-  if (!user || user.isBlocked) throw new ApiError(401, "Invalid credentials");
-  if (!user.emailVerifiedAt) throw new ApiError(403, "Verify email first");
+  const user = await User.findOne({ email: normalizedEmail });
+  if (!user || user.isBlocked)
+    throw new ApiError(401, "Invalid credentials");
+
+  if (!user.emailVerifiedAt)
+    throw new ApiError(403, "Verify your email first");
 
   const account = await Account.findOne({
     userId: user._id,
     provider: "credentials",
   }).select("+passwordHash");
+
   if (!account || !(await compareValue(password, account.passwordHash))) {
     throw new ApiError(401, "Invalid credentials");
   }
 
-  // Create Session
+  // ===============================
+  // 2FA REQUIRED
+  // ===============================
+  if (user.twoFactorEnabled) {
+    if (!loginCode && !recoveryCode) {
+      return res.json(
+        new ApiResponse(
+          200,
+          { mfaRequired: true },
+          "2FA code required"
+        )
+      );
+    }
+
+    const userWithSecrets = await User.findById(user._id).select(
+      "+twoFactorSecret +twoFactorRecoveryCodes"
+    );
+
+    let isValid = false;
+
+    if (loginCode) {
+      try {
+        isValid = userWithSecrets.verifyTwoFactorCode(loginCode);
+      } catch (err) {
+        await userWithSecrets.save();
+        throw new ApiError(423, err.message);
+      }
+    }
+
+    if (recoveryCode) {
+      isValid = userWithSecrets.verifyRecoveryCode(recoveryCode);
+    }
+
+    await userWithSecrets.save();
+
+    if (!isValid) throw new ApiError(401, "Invalid 2FA code");
+  }
+
+  // ===============================
+  // CREATE SESSION
+  // ===============================
   const session = await Session.create({
     userId: user._id,
     ipAddress: req.ip,
@@ -132,18 +159,23 @@ const loginUser = asyncHandler(async (req, res) => {
     userId: user._id,
     sessionId: session._id,
   });
-  const refreshToken = signRefreshToken({ sessionId: session._id });
 
-  // Store refresh token hash for reuse detection
+  const refreshToken = signRefreshToken({
+    sessionId: session._id,
+  });
+
   session.refreshTokenHash = await hashValue(refreshToken);
   await session.save();
 
-  return res
-    .status(200)
-    .json(
-      new ApiResponse(200, { accessToken, refreshToken }, "Login successful"),
-    );
+  return res.json(
+    new ApiResponse(
+      200,
+      { accessToken, refreshToken },
+      "Login successful"
+    )
+  );
 });
+
 
 // ==========================================
 // 3. REFRESH TOKEN (Rotation & Theft Protection)
@@ -168,7 +200,6 @@ const refreshAccessToken = asyncHandler(async (req, res) => {
   const isValid = await compareValue(refreshToken, oldSession.refreshTokenHash);
 
   if (!isValid) {
-    // SECURITY: Token reuse detected! Revoke session immediately.
     await Session.updateOne(
       { _id: payload.sessionId },
       { revokedAt: new Date() },
@@ -176,7 +207,6 @@ const refreshAccessToken = asyncHandler(async (req, res) => {
     throw new ApiError(401, "Security alert: Token reuse detected");
   }
 
-  // Rotate Session
   oldSession.revokedAt = new Date();
   await oldSession.save();
 
@@ -244,11 +274,9 @@ const resendVerificationEmail = asyncHandler(async (req, res) => {
 
   const user = await User.findOne({ email });
   if (!user || user.emailVerifiedAt) {
-    // Don't reveal user status
     return res.json(new ApiResponse(200, {}, "Email sent if account exists"));
   }
 
-  // Rate Limit: Check attempts in last 3 mins
   const count = await Verification.countDocuments({
     identifier: email,
     type: "email-verification",
@@ -257,7 +285,6 @@ const resendVerificationEmail = asyncHandler(async (req, res) => {
 
   if (count >= 2) throw new ApiError(429, "Too many requests");
 
-  // Cleanup old tokens
   await Verification.deleteMany({
     identifier: email,
     type: "email-verification",
@@ -293,7 +320,6 @@ const forgotPassword = asyncHandler(async (req, res) => {
   if (!user)
     return res.json(new ApiResponse(200, {}, "Email sent if account exists"));
 
-  // Rate Limit
   const count = await Verification.countDocuments({
     identifier: email,
     type: "password-reset",
@@ -351,7 +377,6 @@ const resetPassword = asyncHandler(async (req, res) => {
   verification.usedAt = new Date();
   await verification.save();
 
-  // SECURITY: Revoke all active sessions upon password change
   await Session.updateMany(
     { userId: user._id, revokedAt: null },
     { revokedAt: new Date() },
@@ -359,6 +384,44 @@ const resetPassword = asyncHandler(async (req, res) => {
 
   return res.json(new ApiResponse(200, {}, "Password reset successful"));
 });
+
+const getProfile = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.userId);
+  return res.json(new ApiResponse(200, { user }, "Profile"));
+});
+
+export const googleCallback = async (req, res) => {
+  const user = req.user;
+
+  const session = await Session.create({
+    userId: user._id,
+    ipAddress: req.ip,
+    userAgent: req.headers["user-agent"],
+  });
+
+  const accessToken = signAccessToken({
+    userId: user._id,
+    sessionId: session._id,
+  });
+
+  const refreshToken = signRefreshToken({
+    sessionId: session._id,
+  });
+
+  session.refreshTokenHash = await hashValue(refreshToken);
+  await session.save();
+
+  return res.json(
+    new ApiResponse(
+      200,
+      {
+        accessToken,
+        refreshToken,
+      },
+      "Google login successful"
+    )
+  );
+};
 
 const logoutUser = asyncHandler(async (req, res) => {
   if (!req.sessionId) throw new ApiError(400, "Session missing");
@@ -375,4 +438,5 @@ export {
   resendVerificationEmail,
   forgotPassword,
   resetPassword,
+  getProfile,
 };

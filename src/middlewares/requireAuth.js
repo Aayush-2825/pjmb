@@ -6,11 +6,15 @@ import { verifyAccessToken } from "../utils/jwt.js";
 export const requireAuth = asyncHandler(async (req, res, next) => {
   const authHeader = req.headers.authorization;
 
-  if (!authHeader?.startsWith("Bearer ")) {
-    throw new ApiError(401, "Unauthorized", []);
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    throw new ApiError(401, "Authorization token missing or malformed");
   }
 
   const token = authHeader.split(" ")[1];
+
+  if (!token) {
+    throw new ApiError(401, "Access token not found");
+  }
   const payload = verifyAccessToken(token);
 
   const session = await Session.findOne({
