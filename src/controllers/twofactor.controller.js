@@ -170,6 +170,28 @@ const disableTwoFactor = asyncHandler(async (req, res) => {
   );
 });
 
+const generateTwoFactorRecoveryCodes = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.userId).select(
+    "+twoFactorEnabled +twoFactorRecoveryCodes"
+  );
+  if (!user) throw new ApiError(404, "User not found");
+  if (!user.twoFactorEnabled)
+    throw new ApiError(400, "2FA not enabled");
+  const rawCodes = Array.from({ length: 8 }, () => 
+    crypto.randomBytes(4).toString("hex")
+  );
+  user.twoFactorRecoveryCodes = rawCodes.map(hashRecoveryCode);
+  await user.save();
+  return res.json(
+    new ApiResponse(
+      200,
+      { recoveryCodes: rawCodes },
+      "New recovery codes generated — save them securely"
+    )
+  );
+
+})
+
 export {
   setupTwoFactor,
   twoFactorStatus,
@@ -177,4 +199,5 @@ export {
   verifyTwoFactor,
   verifyTwoFactorRecovery,
   disableTwoFactor,
+  generateTwoFactorRecoveryCodes,
 };
