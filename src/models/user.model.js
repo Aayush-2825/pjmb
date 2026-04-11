@@ -115,28 +115,17 @@ userSchema.pre("save", function () {
 userSchema.pre("validate", async function () {
   if (this.username) return;
 
-  const base = this.name
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "")
-    .slice(0, 20);
-
+  const base = this.name.replace(/\s+/g, "_").toLowerCase();
   let username = base;
   const User = mongoose.models.User;
+  let count = 0;
 
-  if (!(await User.exists({ username }))) {
-    this.username = username;
-    return;
+  while (await User.exists({ username })) {
+    count += 1;
+    username = `${base}_${count}`;
   }
+  this.username = username;
 
-  while (true) {
-    const suffix = Math.floor(1000 + Math.random() * 9000);
-    username = `${base}_${suffix}`;
-
-    if (!(await User.exists({ username }))) {
-      this.username = username;
-      return;
-    }
-  }
 });
 
 

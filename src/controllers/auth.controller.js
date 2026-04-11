@@ -60,7 +60,7 @@ const registerUser = asyncHandler(async (req, res) => {
       }
     );
 
-    const verificationUrl = `${process.env.APP_ORIGIN}/confirm-account?code=${rawVerificationToken}`;
+    const verificationUrl = `${process.env.FRONTEND_URL}/verify-email?code=${rawVerificationToken}`;
 
     setImmediate(() => {
       sendEmail({
@@ -158,6 +158,7 @@ const loginUser = asyncHandler(async (req, res) => {
   const accessToken = signAccessToken({
     userId: user._id,
     sessionId: session._id,
+    role: user.role,
   });
 
   const refreshToken = signRefreshToken({
@@ -195,6 +196,9 @@ const refreshAccessToken = asyncHandler(async (req, res) => {
     _id: payload.sessionId,
     revokedAt: null,
   }).select("+refreshTokenHash");
+
+  const user = await User.findById(oldSession.userId);
+  const role = user.role;
   if (!oldSession) throw new ApiError(401, "Session expired");
 
   const isValid = await compareValue(refreshToken, oldSession.refreshTokenHash);
@@ -220,6 +224,7 @@ const refreshAccessToken = asyncHandler(async (req, res) => {
   const newAccessToken = signAccessToken({
     userId: oldSession.userId,
     sessionId: newSession._id,
+    role: role,
   });
   const newRefreshToken = signRefreshToken({ sessionId: newSession._id });
 
@@ -402,6 +407,7 @@ export const googleCallback = async (req, res) => {
   const accessToken = signAccessToken({
     userId: user._id,
     sessionId: session._id,
+    role: user.role,
   });
 
   const refreshToken = signRefreshToken({
